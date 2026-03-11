@@ -47,16 +47,48 @@ from typing import Optional, Callable
 
 ANDRUX_VERSION = "2.0.0"
 ANDRUX_CODENAME = "PHANTOM"
-ANDRUX_DIR = Path.home() / ".andrux"
-HISTORY_FILE = ANDRUX_DIR / "history.json"
-ALIAS_FILE = ANDRUX_DIR / "aliases.json"
-CONFIG_FILE = ANDRUX_DIR / "config.json"
-LOG_FILE = ANDRUX_DIR / "andrux.log"
-SCRIPTS_DIR = ANDRUX_DIR / "scripts"
 
 IS_ANDROID = hasattr(sys, "getandroidapilevel") or os.path.exists("/system/app")
 IS_WINDOWS = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
+
+# ── BUG FIX #1: Path seguro para Android ──────────────────────────
+# Path.home() no Android aponta para um local sem permissão de escrita,
+# causando OSError e fechamento imediato do app.
+# Solução: detectar a plataforma e usar o diretório gravável correto.
+def _get_safe_base_dir() -> Path:
+    """Retorna diretório base com garantia de escrita em qualquer plataforma."""
+    candidates = []
+    if IS_ANDROID:
+        # Android: tempfile.gettempdir() retorna /data/local/tmp — sempre gravável.
+        candidates = [
+            Path(tempfile.gettempdir()) / "andrux",
+            Path("/data/local/tmp/andrux"),
+        ]
+    else:
+        candidates = [
+            Path.home() / ".andrux",
+            Path(tempfile.gettempdir()) / "andrux",
+        ]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            test_file = candidate / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+            return candidate
+        except OSError:
+            continue
+    fallback = Path(tempfile.gettempdir()) / "andrux_fallback"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+ANDRUX_DIR   = _get_safe_base_dir()
+HISTORY_FILE = ANDRUX_DIR / "history.json"
+ALIAS_FILE   = ANDRUX_DIR / "aliases.json"
+CONFIG_FILE  = ANDRUX_DIR / "config.json"
+LOG_FILE     = ANDRUX_DIR / "andrux.log"
+SCRIPTS_DIR  = ANDRUX_DIR / "scripts"
 
 # Retro terminal color palette (ANSI-style mapped to Flet colors)
 COLORS = {
@@ -447,7 +479,11 @@ class AndruxShell:
     """
 
     def __init__(self):
-        self.cwd = str(Path.home())
+        # BUG FIX #1 (parte 2): cwd inicial também precisa ser gravável no Android
+        if IS_ANDROID:
+            self.cwd = tempfile.gettempdir()
+        else:
+            self.cwd = str(Path.home())
         self.env = os.environ.copy()
         self._process: Optional[subprocess.Popen] = None
         self._running = False
@@ -502,11 +538,33 @@ class AndruxShell:
                 self._running = False
                 return
 
-            # Determina shell a usar
+            # ── BUG FIX #2: Shell correto por plataforma ──────────────
+            # Android não tem 'bash' nativamente fora do Termux.
+            # O shell universal do Android é /system/bin/sh.
+            # Fazemos detecção em ordem de preferência.
             if IS_WINDOWS:
                 shell_exec = ["cmd", "/c", command]
+            elif IS_ANDROID:
+                # Tenta sh do Android, com fallback para qualquer sh disponível
+                for sh in ["/system/bin/sh", "/bin/sh", "sh"]:
+                    if IS_WINDOWS:
+                        break
+                    try:
+                        if sh.startswith("/"):
+                            if os.path.isfile(sh):
+                                shell_exec = [sh, "-c", command]
+                                break
+                        else:
+                            if shutil.which(sh):
+                                shell_exec = [sh, "-c", command]
+                                break
+                    except Exception:
+                        continue
+                else:
+                    shell_exec = ["sh", "-c", command]
             else:
-                shell_exec = ["bash", "-c", command]
+                # Linux/macOS: prefere bash, cai para sh
+                shell_exec = [shutil.which("bash") or "sh", "-c", command]
 
             try:
                 self._process = subprocess.Popen(
@@ -1159,6 +1217,7 @@ class AndruxApp:
         self._output_lines: list[ft.Control] = []
         self._suggest_row: Optional[ft.Row] = None
         self._is_executing = False
+        self._clock_alive = True  # BUG FIX #3: flag para parar thread do relógio
 
         def output_bridge(text: str, color: str, bold: bool):
             self._append_output(text, color, bold)
@@ -1185,10 +1244,19 @@ class AndruxApp:
         p.bgcolor = COLORS["bg"]
         p.padding = 0
         p.spacing = 0
-        p.fonts = {
-            "mono": "https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap",
-        }
-        p.theme = ft.Theme(font_family="Share Tech Mono")
+        # ── BUG FIX #4: Fonte local, sem depender de internet ─────────
+        # Google Fonts via URL falha se o device estiver offline ou a rede
+        # demorar, travando a renderização da GUI.
+        # Solução: registrar a fonte de um arquivo .ttf local (pasta assets/).
+        # Se o arquivo não existir, o Flet usa a fonte monospace do sistema
+        # como fallback seguro — nunca trava.
+        font_path = Path(__file__).parent / "assets" / "ShareTechMono.ttf"
+        if font_path.exists():
+            p.fonts = {"mono": str(font_path)}
+        else:
+            # Fallback: usa monospace do sistema. Sem crash, sem freeze.
+            p.fonts = {}
+        p.theme = ft.Theme(font_family="mono")
         p.window_bgcolor = COLORS["bg"]
         p.window_title_bar_hidden = False
         if not IS_ANDROID:
@@ -1210,15 +1278,10 @@ class AndruxApp:
                         color=COLORS["green"],
                         size=13,
                         weight=ft.FontWeight.BOLD,
-                        font_family="Share Tech Mono",
+                        font_family="mono",
                     ),
                     ft.Container(expand=True),
-                    ft.Text(
-                        timestamp(),
-                        color=COLORS["green_dim"],
-                        size=11,
-                        font_family="Share Tech Mono",
-                    ),
+                    clock_text,
                 ],
                 alignment=ft.MainAxisAlignment.START,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1228,18 +1291,37 @@ class AndruxApp:
             border=ft.border.only(bottom=ft.BorderSide(1, COLORS["border"])),
         )
 
-        # Atualiza relógio a cada segundo
+        # ── BUG FIX #3: Relógio sem thread leak ───────────────────────
+        # O update() num control que saiu de tela lança exceção e derruba
+        # o app em background. Solução: flag de vida + try/except completo
+        # + parar o loop quando a página for fechada.
+        clock_text = ft.Text(
+            timestamp(),
+            color=COLORS["green_dim"],
+            size=11,
+            font_family="mono",
+        )
+        self._clock_alive = True
+
         def tick():
-            while True:
+            while self._clock_alive:
                 time.sleep(1)
-                if topbar.content and topbar.content.controls:
-                    topbar.content.controls[-1].value = timestamp()
-                    try:
-                        topbar.update()
-                    except Exception:
+                try:
+                    if not self._clock_alive:
                         break
+                    clock_text.value = timestamp()
+                    clock_text.update()
+                except Exception:
+                    # Control foi destruído ou página fechou — para silenciosamente
+                    self._clock_alive = False
+                    break
 
         threading.Thread(target=tick, daemon=True).start()
+
+        def _on_page_close(e):
+            self._clock_alive = False
+
+        self.page.on_close = _on_page_close
 
         # ── Output console ───────────────────────────────────────────
         self.output_list = ft.ListView(
@@ -1280,7 +1362,7 @@ class AndruxApp:
             self._get_prompt(),
             color=COLORS["green"],
             size=13,
-            font_family="Share Tech Mono",
+            font_family="mono",
             weight=ft.FontWeight.BOLD,
         )
 
@@ -1291,7 +1373,7 @@ class AndruxApp:
             text_style=ft.TextStyle(
                 color=COLORS["white"],
                 size=13,
-                font_family="Share Tech Mono",
+                font_family="mono",
             ),
             border=ft.InputBorder.NONE,
             expand=True,
@@ -1308,6 +1390,92 @@ class AndruxApp:
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
 
+        # ── BUG FIX #5: Botões de toque para mobile ───────────────────
+        # Celular não tem Arrow Up/Down nem Tab físico.
+        # Adicionamos uma barra de ação acima do input com botões visíveis.
+        def _btn(icon, tooltip, on_click, color=COLORS["green_dim"]):
+            return ft.IconButton(
+                icon=icon,
+                tooltip=tooltip,
+                icon_color=color,
+                icon_size=20,
+                on_click=on_click,
+                style=ft.ButtonStyle(
+                    padding=ft.padding.all(4),
+                    overlay_color=COLORS["green_dark"],
+                ),
+            )
+
+        def on_hist_prev(_):
+            prev = self.history.prev()
+            if prev is not None and self.input_field:
+                self.input_field.value = prev
+                try:
+                    self.input_field.update()
+                except Exception:
+                    pass
+
+        def on_hist_next(_):
+            nxt = self.history.next()
+            if nxt is not None and self.input_field:
+                self.input_field.value = nxt
+                try:
+                    self.input_field.update()
+                except Exception:
+                    pass
+
+        def on_tab(_):
+            if self.input_field:
+                partial = self.input_field.value or ""
+                suggestions = self.kernel.suggest(partial)
+                if suggestions:
+                    self.input_field.value = suggestions[0] + " "
+                    try:
+                        self.input_field.update()
+                    except Exception:
+                        pass
+
+        def on_interrupt(_):
+            if self.shell.is_running():
+                self.shell.interrupt()
+                self._append_output("^C", COLORS["yellow"], False)
+            else:
+                if self.input_field:
+                    self.input_field.value = ""
+                    try:
+                        self.input_field.update()
+                    except Exception:
+                        pass
+
+        def on_clear_input(_):
+            if self.input_field:
+                self.input_field.value = ""
+                try:
+                    self.input_field.update()
+                except Exception:
+                    pass
+
+        touch_toolbar = ft.Container(
+            content=ft.Row(
+                [
+                    _btn(ft.icons.ARROW_UPWARD,   "Histórico anterior (↑)", on_hist_prev),
+                    _btn(ft.icons.ARROW_DOWNWARD,  "Próximo histórico (↓)",  on_hist_next),
+                    _btn(ft.icons.AUTO_AWESOME,    "Autocomplete (Tab)",     on_tab,
+                         color=COLORS["cyan"]),
+                    ft.Container(expand=True),
+                    _btn(ft.icons.BACKSPACE_OUTLINED, "Limpar input",        on_clear_input,
+                         color=COLORS["grey"]),
+                    _btn(ft.icons.STOP_CIRCLE_OUTLINED, "Interromper (^C)",  on_interrupt,
+                         color=COLORS["red"]),
+                ],
+                spacing=0,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            bgcolor=COLORS["bg_secondary"],
+            padding=ft.padding.symmetric(horizontal=6, vertical=2),
+            border=ft.border.only(top=ft.BorderSide(1, COLORS["border"])),
+        )
+
         input_bar = ft.Container(
             content=input_row,
             bgcolor=COLORS["panel"],
@@ -1320,7 +1488,7 @@ class AndruxApp:
             f"  {self.shell.get_prompt_path()}  |  ready",
             color=COLORS["green_dim"],
             size=10,
-            font_family="Share Tech Mono",
+            font_family="mono",
         )
         status_container = ft.Container(
             content=self.status_bar,
@@ -1328,7 +1496,7 @@ class AndruxApp:
             padding=ft.padding.symmetric(horizontal=8, vertical=3),
         )
 
-        # ── Key handler ───────────────────────────────────────────────
+        # ── Key handler (desktop) ─────────────────────────────────────
         self.page.on_keyboard_event = self._on_keyboard
 
         # ── Assemble ──────────────────────────────────────────────────
@@ -1338,6 +1506,7 @@ class AndruxApp:
                     topbar,
                     output_container,
                     suggest_container,
+                    touch_toolbar,
                     input_bar,
                     status_container,
                 ],
@@ -1375,7 +1544,7 @@ class AndruxApp:
                 f"{ts}{text}",
                 color=color_actual,
                 size=cfg_size,
-                font_family="Share Tech Mono",
+                font_family="mono",
                 weight=ft.FontWeight.BOLD if bold else ft.FontWeight.NORMAL,
                 selectable=True,
                 no_wrap=False,
@@ -1436,7 +1605,7 @@ class AndruxApp:
                     chip = ft.Container(
                         content=ft.Text(
                             s, color=COLORS["bg"], size=10,
-                            font_family="Share Tech Mono",
+                            font_family="mono",
                         ),
                         bgcolor=COLORS["green_dim"],
                         border_radius=3,
