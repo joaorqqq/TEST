@@ -1,0 +1,40 @@
+name: Andrux APK Builder
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Permite rodar manualmente pelo botão no GitHub
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Flet CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install flet
+
+      - name: Setup Java (Required for Android)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build APK
+        run: |
+          # O comando 'flet build apk' no Linux baixa o Flutter automaticamente
+          flet build apk --project-name "andrux" --product "Andrux Terminal"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: andrux-release-apk
+          path: build/apk/*.apk
