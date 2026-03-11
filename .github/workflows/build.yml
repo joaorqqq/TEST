@@ -30,8 +30,8 @@ jobs:
 
       - name: Build APK
         run: |
-          # Comando simplificado para evitar erros de versão
-          flet build apk
+          # O 'yes' força a resposta 'y' para a instalação do Flutter SDK
+          yes | flet build apk
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
