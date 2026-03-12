@@ -1,26 +1,22 @@
 """
-╔═══════════════════════════════════════════════════════════════╗
-║                    ANDRUX TERMINAL v2.0                       ║
-║         Mobile-First Python Terminal Ecosystem                ║
-║         GUI: Flet | Kernel: Custom Syntax Translator          ║
-╚═══════════════════════════════════════════════════════════════╝
-
-ARCHITECTURE:
-  - AndruxKernel     : Intercepta e traduz sintaxe de comandos
-  - AndruxShell      : Executa comandos traduzidos com output em tempo real
-  - AndruxHistory    : Histórico persistente de comandos
-  - AndruxAliasDB    : Banco de aliases customizados
-  - AndruxPermission : Gerencia permissões Android
-  - AndruxApp        : Interface Flet (GUI retro/hacker)
-
-INSTALL DEPS:
-  pip install flet
-
-RUN (Desktop preview):
-  python andrux.py
-
-RUN (Android via BeeWare/Briefcase or Flet mobile):
-  flet run andrux.py --android
+╔═══════════════════════════════════════════════════════════════════╗
+║                    ANDRUX TERMINAL v2.0                           ║
+║         Mobile-First Python Terminal Ecosystem                    ║
+║         ARQUIVO ÚNICO — GUI + Kernel + Motor Nativo               ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  MÓDULOS EMBUTIDOS:                                               ║
+║  - AndruxKernel     : Tradução de sintaxe de comandos             ║
+║  - AndruxShell      : Executor com streaming de output            ║
+║  - AndruxHistory    : Histórico persistente                       ║
+║  - AndruxAliasDB    : Aliases customizados                        ║
+║  - AndruxPermission : Permissões Android                          ║
+║  - NativeEngine     : Comandos Python puro (sem binários)         ║
+║  - AndruxApp        : Interface Flet retro/hacker                 ║
+╠═══════════════════════════════════════════════════════════════════╣
+║  INSTALL:  pip install flet                                       ║
+║  RUN PC:   python andrux.py                                       ║
+║  RUN APK:  flet build apk                                         ║
+╚═══════════════════════════════════════════════════════════════════╝
 """
 
 import flet as ft
@@ -39,6 +35,9 @@ import textwrap
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable
+
+# Motor nativo: embutido abaixo (NativeEngine)
+_NATIVE_AVAILABLE = True
 
 
 # ─────────────────────────────────────────────
@@ -122,6 +121,1565 @@ DEFAULT_CONFIG = {
     "animation_speed": 30,    # ms per character for typewriter effect
     "max_output_lines": 2000,
 }
+
+
+# ── Imports adicionais do motor nativo ──────────────────────────────
+from __future__ import annotations
+import stat
+import gzip
+import socket
+import struct
+import tarfile
+import hashlib
+import fnmatch
+import zipfile
+import urllib.request
+import urllib.error
+import urllib.parse
+import importlib.util
+from io import StringIO, BytesIO
+
+try:
+    import importlib.metadata as importlib_metadata
+except ImportError:
+    try:
+        import importlib_metadata  # backport
+    except ImportError:
+        importlib_metadata = None
+
+try:
+    import subprocess as subprocess
+    _HAS_SUBPROCESS = True
+except ImportError:
+    _HAS_SUBPROCESS = False
+
+
+# Tipo de output line: (texto, categoria)
+# categoria: "out" | "err" | "info" | "warn"
+Line = tuple[str, str]
+CmdGenerator = Generator[Line, None, int]  # yields Lines, returns exit code
+
+
+# ─────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def _fmt_size(n: int) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.1f}{unit}" if unit != "B" else f"{n}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+def _fmt_perms(mode: int) -> str:
+    kinds = {
+        stat.S_IFDIR: "d", stat.S_IFLNK: "l", stat.S_IFREG: "-",
+        stat.S_IFBLK: "b", stat.S_IFCHR: "c", stat.S_IFIFO: "p",
+    }
+    kind = kinds.get(stat.S_IFMT(mode), "?")
+    bits = ""
+    for who in ("USR", "GRP", "OTH"):
+        bits += "r" if mode & getattr(stat, f"S_IR{who}") else "-"
+        bits += "w" if mode & getattr(stat, f"S_IW{who}") else "-"
+        bits += "x" if mode & getattr(stat, f"S_IX{who}") else "-"
+    return kind + bits
+
+def _resolve(path: str, cwd: str) -> Path:
+    p = Path(os.path.expanduser(os.path.expandvars(path)))
+    if not p.is_absolute():
+        p = Path(cwd) / p
+    return p.resolve()
+
+def _out(text: str) -> Line:
+    return (text, "out")
+
+def _err(text: str) -> Line:
+    return (text, "err")
+
+def _info(text: str) -> Line:
+    return (text, "info")
+
+def _warn(text: str) -> Line:
+    return (text, "warn")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ARQUIVO — ls, cat, mkdir, rm, cp, mv, find, du, df, which, touch, wc
+# ─────────────────────────────────────────────────────────────────
+
+def native_ls(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """ls -la nativo: lista arquivos com permissões, tamanho e data."""
+    # Parse simples de flags e paths
+    flags = set()
+    paths = []
+    for a in args:
+        if a.startswith("-"):
+            flags.update(a[1:])
+        else:
+            paths.append(a)
+
+    show_hidden = "a" in flags
+    long_format = "l" in flags or True  # sempre long no Andrux
+
+    targets = [_resolve(p, cwd) for p in paths] if paths else [Path(cwd)]
+
+    for target in targets:
+        if len(targets) > 1:
+            yield _out(f"\n{target}:")
+
+        if target.is_dir():
+            try:
+                entries = sorted(
+                    target.iterdir(),
+                    key=lambda p: (not p.is_dir(), p.name.lower())
+                )
+            except PermissionError:
+                yield _err(f"ls: '{target}': Permissão negada")
+                continue
+
+            if not show_hidden:
+                entries = [e for e in entries if not e.name.startswith(".")]
+
+            total_blocks = sum(
+                (e.stat().st_size // 512) for e in entries
+                if not e.is_symlink() and e.exists()
+            )
+            yield _out(f"total {total_blocks}")
+
+            for entry in entries:
+                try:
+                    s = entry.lstat()
+                    perms = _fmt_perms(s.st_mode)
+                    nlinks = s.st_nlink
+                    size = _fmt_size(s.st_size) if "h" in flags else str(s.st_size)
+                    mtime = datetime.fromtimestamp(s.st_mtime).strftime("%b %d %H:%M")
+                    name = entry.name
+                    if entry.is_symlink():
+                        try:
+                            name += f" -> {os.readlink(entry)}"
+                        except OSError:
+                            pass
+                    yield _out(f"{perms}  {nlinks:3}  {size:>8}  {mtime}  {name}")
+                except OSError as exc:
+                    yield _err(f"ls: '{entry.name}': {exc.strerror}")
+        elif target.exists():
+            try:
+                s = target.lstat()
+                yield _out(
+                    f"{_fmt_perms(s.st_mode)}  1  {s.st_size:>8}  "
+                    f"{datetime.fromtimestamp(s.st_mtime).strftime('%b %d %H:%M')}  {target.name}"
+                )
+            except OSError as exc:
+                yield _err(str(exc))
+        else:
+            yield _err(f"ls: '{target}': Arquivo ou diretório não encontrado")
+    return 0
+
+
+def native_cat(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """cat nativo: exibe conteúdo de arquivos."""
+    if not args:
+        yield _err("cat: nenhum arquivo especificado")
+        return 1
+
+    show_lines = "-n" in args
+    files = [a for a in args if not a.startswith("-")]
+
+    for fname in files:
+        path = _resolve(fname, cwd)
+        if not path.exists():
+            yield _err(f"cat: '{fname}': Arquivo não encontrado")
+            continue
+        if path.is_dir():
+            yield _err(f"cat: '{fname}': É um diretório")
+            continue
+        try:
+            # Tenta decodificar como texto; se falhar, mostra hex
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except UnicodeDecodeError:
+                content = path.read_text(encoding="latin-1")
+            for i, line in enumerate(content.splitlines(), 1):
+                prefix = f"{i:6}\t" if show_lines else ""
+                yield _out(f"{prefix}{line}")
+        except PermissionError:
+            yield _err(f"cat: '{fname}': Permissão negada")
+        except OSError as exc:
+            yield _err(f"cat: '{fname}': {exc.strerror}")
+    return 0
+
+
+def native_mkdir(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """mkdir -p nativo."""
+    if not args:
+        yield _err("mkdir: nenhum caminho especificado")
+        return 1
+    parents = "-p" in args
+    dirs = [a for a in args if not a.startswith("-")]
+    for d in dirs:
+        path = _resolve(d, cwd)
+        try:
+            path.mkdir(parents=parents, exist_ok=parents)
+            yield _info(f"✓ Diretório criado: {path}")
+        except FileExistsError:
+            yield _err(f"mkdir: '{d}': Já existe")
+        except PermissionError:
+            yield _err(f"mkdir: '{d}': Permissão negada")
+        except OSError as exc:
+            yield _err(f"mkdir: '{d}': {exc.strerror}")
+    return 0
+
+
+def native_rm(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """rm -rf nativo."""
+    if not args:
+        yield _err("rm: nenhum caminho especificado")
+        return 1
+    flags = set()
+    paths_raw = []
+    for a in args:
+        if a.startswith("-"):
+            flags.update(a[1:])
+        else:
+            paths_raw.append(a)
+    recursive = "r" in flags or "R" in flags
+    force = "f" in flags
+
+    for raw in paths_raw:
+        path = _resolve(raw, cwd)
+        try:
+            if not path.exists() and not path.is_symlink():
+                if not force:
+                    yield _err(f"rm: '{raw}': Arquivo não encontrado")
+                continue
+            if path.is_dir() and not path.is_symlink():
+                if recursive:
+                    shutil.rmtree(path)
+                    yield _info(f"✓ Removido: {path}")
+                else:
+                    yield _err(f"rm: '{raw}': É um diretório (use -r)")
+            else:
+                path.unlink()
+                yield _info(f"✓ Removido: {path}")
+        except PermissionError:
+            yield _err(f"rm: '{raw}': Permissão negada")
+        except OSError as exc:
+            yield _err(f"rm: '{raw}': {exc.strerror}")
+    return 0
+
+
+def native_cp(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """cp -r nativo."""
+    flags = set()
+    paths_raw = [a for a in args if not a.startswith("-")]
+    for a in args:
+        if a.startswith("-"):
+            flags.update(a[1:])
+    if len(paths_raw) < 2:
+        yield _err("cp: uso: cp [-r] <origem> <destino>")
+        return 1
+    src = _resolve(paths_raw[0], cwd)
+    dst = _resolve(paths_raw[1], cwd)
+    recursive = "r" in flags or "R" in flags
+    try:
+        if src.is_dir():
+            if not recursive:
+                yield _err(f"cp: '{src}': É um diretório (use -r)")
+                return 1
+            dest_path = dst / src.name if dst.is_dir() else dst
+            shutil.copytree(src, dest_path)
+        else:
+            dst_path = dst / src.name if dst.is_dir() else dst
+            shutil.copy2(src, dst_path)
+        yield _info(f"✓ Copiado: {src} → {dst}")
+        return 0
+    except PermissionError:
+        yield _err(f"cp: Permissão negada")
+        return 1
+    except OSError as exc:
+        yield _err(f"cp: {exc.strerror}")
+        return 1
+
+
+def native_mv(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """mv nativo."""
+    paths_raw = [a for a in args if not a.startswith("-")]
+    if len(paths_raw) < 2:
+        yield _err("mv: uso: mv <origem> <destino>")
+        return 1
+    src = _resolve(paths_raw[0], cwd)
+    dst = _resolve(paths_raw[1], cwd)
+    try:
+        target = dst / src.name if dst.is_dir() else dst
+        shutil.move(str(src), str(target))
+        yield _info(f"✓ Movido: {src} → {target}")
+        return 0
+    except PermissionError:
+        yield _err("mv: Permissão negada")
+        return 1
+    except OSError as exc:
+        yield _err(f"mv: {exc.strerror}")
+        return 1
+
+
+def native_find(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """find nativo com suporte a -name, -type, -size."""
+    # Parsing: find [path] [-name pattern] [-type f|d] [-maxdepth N]
+    search_dir = cwd
+    name_pattern = None
+    type_filter = None
+    max_depth = 999
+    i = 0
+    positional = []
+    while i < len(args):
+        a = args[i]
+        if a == "-name" and i + 1 < len(args):
+            name_pattern = args[i + 1]; i += 2
+        elif a == "-type" and i + 1 < len(args):
+            type_filter = args[i + 1]; i += 2
+        elif a == "-maxdepth" and i + 1 < len(args):
+            max_depth = int(args[i + 1]); i += 2
+        elif not a.startswith("-"):
+            positional.append(a); i += 1
+        else:
+            i += 1
+
+    if positional:
+        search_dir = str(_resolve(positional[0], cwd))
+
+    count = 0
+    base_depth = search_dir.count(os.sep)
+    for root, dirs, files in os.walk(search_dir):
+        depth = root.count(os.sep) - base_depth
+        if depth > max_depth:
+            dirs.clear()
+            continue
+        entries = []
+        if type_filter != "f":
+            entries += [(d, True) for d in dirs]
+        if type_filter != "d":
+            entries += [(f, False) for f in files]
+        for name, is_dir in entries:
+            if name_pattern and not fnmatch.fnmatch(name, name_pattern):
+                continue
+            full = os.path.join(root, name)
+            yield _out(full)
+            count += 1
+    if count == 0:
+        yield _info("(nenhum resultado)")
+    return 0
+
+
+def native_du(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """du -sh nativo."""
+    paths_raw = [a for a in args if not a.startswith("-")]
+    target = _resolve(paths_raw[0], cwd) if paths_raw else Path(cwd)
+    total = 0
+    try:
+        if target.is_dir():
+            for root, dirs, files in os.walk(target):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        else:
+            total = target.stat().st_size
+        yield _out(f"{_fmt_size(total)}\t{target}")
+        return 0
+    except PermissionError:
+        yield _err(f"du: '{target}': Permissão negada")
+        return 1
+
+
+def native_df(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """df -h nativo usando shutil.disk_usage."""
+    yield _out(f"{'Filesystem':<25} {'Size':>8} {'Used':>8} {'Avail':>8} {'Use%':>5}  Mounted on")
+    check_paths = ["/", cwd]
+    if os.path.exists("/storage/emulated/0"):
+        check_paths.append("/storage/emulated/0")
+    seen = set()
+    for p in check_paths:
+        try:
+            usage = shutil.disk_usage(p)
+            if usage.total in seen:
+                continue
+            seen.add(usage.total)
+            pct = int(usage.used / usage.total * 100) if usage.total else 0
+            yield _out(
+                f"{p:<25} {_fmt_size(usage.total):>8} "
+                f"{_fmt_size(usage.used):>8} {_fmt_size(usage.free):>8} "
+                f"{pct:>4}%  {p}"
+            )
+        except OSError:
+            pass
+    return 0
+
+
+def native_which(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """which nativo."""
+    if not args:
+        yield _err("which: nenhum comando especificado")
+        return 1
+    for cmd in args:
+        found = shutil.which(cmd)
+        if found:
+            yield _out(found)
+        else:
+            yield _err(f"{cmd}: não encontrado")
+    return 0 if all(shutil.which(a) for a in args) else 1
+
+
+def native_touch(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """touch nativo."""
+    for fname in args:
+        path = _resolve(fname, cwd)
+        try:
+            path.touch(exist_ok=True)
+            yield _info(f"✓ {path}")
+        except PermissionError:
+            yield _err(f"touch: '{fname}': Permissão negada")
+    return 0
+
+
+def native_wc(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """wc -l nativo."""
+    flags = set()
+    files = []
+    for a in args:
+        if a.startswith("-"):
+            flags.update(a[1:])
+        else:
+            files.append(a)
+    count_lines = "l" in flags or not flags
+    count_words = "w" in flags
+    count_bytes = "c" in flags
+
+    for fname in files:
+        path = _resolve(fname, cwd)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lines = text.count("\n")
+            words = len(text.split())
+            bts = path.stat().st_size
+            parts = []
+            if count_lines:
+                parts.append(f"{lines:8}")
+            if count_words:
+                parts.append(f"{words:8}")
+            if count_bytes:
+                parts.append(f"{bts:8}")
+            yield _out("  ".join(parts) + f"  {fname}")
+        except OSError as exc:
+            yield _err(f"wc: '{fname}': {exc.strerror}")
+    return 0
+
+
+def native_grep(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """grep -rn nativo."""
+    flags = set()
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i].startswith("-"):
+            flags.update(args[i][1:])
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
+
+    if not positional:
+        yield _err("grep: padrão não especificado")
+        return 1
+
+    pattern = positional[0]
+    search_paths = [_resolve(p, cwd) for p in positional[1:]] if len(positional) > 1 else [Path(cwd)]
+    recursive = "r" in flags or "R" in flags
+    show_lines = "n" in flags
+    ignore_case = "i" in flags
+    count_only = "c" in flags
+
+    re_flags = re.IGNORECASE if ignore_case else 0
+    try:
+        compiled = re.compile(pattern, re_flags)
+    except re.error as exc:
+        yield _err(f"grep: padrão inválido: {exc}")
+        return 1
+
+    match_count = 0
+
+    def search_file(fpath: Path):
+        nonlocal match_count
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+            for lineno, line in enumerate(text.splitlines(), 1):
+                if compiled.search(line):
+                    match_count += 1
+                    if not count_only:
+                        prefix = f"{fpath}:" if len(search_paths) > 1 or recursive else ""
+                        lnum = f"{lineno}:" if show_lines else ""
+                        highlighted = compiled.sub(
+                            lambda m: f"[{m.group()}]", line
+                        )
+                        yield _out(f"{prefix}{lnum}{highlighted}")
+        except (PermissionError, OSError):
+            pass
+
+    for sp in search_paths:
+        if sp.is_dir() and recursive:
+            for root, _, files in os.walk(sp):
+                for f in files:
+                    yield from search_file(Path(root) / f)
+        elif sp.is_file():
+            yield from search_file(sp)
+
+    if count_only:
+        yield _out(str(match_count))
+    elif match_count == 0:
+        yield _info("(nenhum resultado)")
+    return 0 if match_count > 0 else 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  COMPRESSÃO — tar, gzip
+# ─────────────────────────────────────────────────────────────────
+
+def native_tar_create(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """tar -czf <output.tar.gz> <path> nativo."""
+    # args já chegam como: -czf arquivo.tar.gz fonte
+    paths_raw = [a for a in args if not a.startswith("-")]
+    if len(paths_raw) < 2:
+        yield _err("tar: uso: compress <arquivo.tar.gz> <origem>")
+        return 1
+    out_path = _resolve(paths_raw[0], cwd)
+    src_path = _resolve(paths_raw[1], cwd)
+    try:
+        mode = "w:gz" if str(out_path).endswith((".tar.gz", ".tgz")) else "w"
+        with tarfile.open(out_path, mode) as tf:
+            tf.add(src_path, arcname=src_path.name)
+        size = out_path.stat().st_size
+        yield _info(f"✓ Comprimido: {out_path} ({_fmt_size(size)})")
+        return 0
+    except PermissionError:
+        yield _err("tar: Permissão negada")
+        return 1
+    except OSError as exc:
+        yield _err(f"tar: {exc.strerror}")
+        return 1
+
+
+def native_tar_extract(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """tar -xzf <arquivo> nativo."""
+    paths_raw = [a for a in args if not a.startswith("-")]
+    if not paths_raw:
+        yield _err("tar: arquivo não especificado")
+        return 1
+    src = _resolve(paths_raw[0], cwd)
+    dest = _resolve(paths_raw[1], cwd) if len(paths_raw) > 1 else Path(cwd)
+    try:
+        with tarfile.open(src, "r:*") as tf:
+            members = tf.getmembers()
+            tf.extractall(dest)
+        yield _info(f"✓ Extraído: {len(members)} arquivo(s) em {dest}")
+        return 0
+    except tarfile.TarError as exc:
+        yield _err(f"tar: {exc}")
+        return 1
+    except OSError as exc:
+        yield _err(f"tar: {exc.strerror}")
+        return 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  REDE — ping, wget, curl, ifconfig, nslookup
+# ─────────────────────────────────────────────────────────────────
+
+def native_ping(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """
+    Ping nativo usando socket TCP na porta 80.
+    ICMP real exige root no Android; TCP é uma boa aproximação.
+    """
+    count = 4
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("-c", "-n") and i + 1 < len(args):
+            try:
+                count = int(args[i + 1])
+            except ValueError:
+                pass
+            i += 2
+        elif not args[i].startswith("-"):
+            positional.append(args[i])
+            i += 1
+        else:
+            i += 1
+
+    if not positional:
+        yield _err("ping: host não especificado")
+        return 1
+
+    host = positional[0]
+    yield _info(f"PING {host} (TCP/80) — {count} tentativas")
+
+    try:
+        resolved_ip = socket.gethostbyname(host)
+        yield _out(f"  → Resolvido: {resolved_ip}")
+    except socket.gaierror as exc:
+        yield _err(f"ping: {host}: {exc.strerror or str(exc)}")
+        return 1
+
+    ok = 0
+    for seq in range(1, count + 1):
+        t0 = time.monotonic()
+        try:
+            with socket.create_connection((resolved_ip, 80), timeout=3):
+                rtt = (time.monotonic() - t0) * 1000
+                yield _out(f"  seq={seq} ip={resolved_ip} time={rtt:.1f}ms")
+                ok += 1
+        except OSError:
+            # Porta 80 fechada não significa host morto; tenta porta 443
+            try:
+                with socket.create_connection((resolved_ip, 443), timeout=3):
+                    rtt = (time.monotonic() - t0) * 1000
+                    yield _out(f"  seq={seq} ip={resolved_ip} port=443 time={rtt:.1f}ms")
+                    ok += 1
+            except OSError:
+                yield _out(f"  seq={seq} ip={resolved_ip} unreachable")
+        time.sleep(0.5)
+
+    loss = int((count - ok) / count * 100)
+    yield _out(f"\n--- {host} ping stats ---")
+    yield _out(f"  {count} enviados, {ok} OK, {loss}% perda")
+    return 0 if ok > 0 else 1
+
+
+def native_wget(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """wget nativo via urllib com barra de progresso."""
+    positional = [a for a in args if not a.startswith("-")]
+    output_file = None
+    for i, a in enumerate(args):
+        if a in ("-O", "--output-document") and i + 1 < len(args):
+            output_file = args[i + 1]
+
+    if not positional:
+        yield _err("wget: URL não especificada")
+        return 1
+
+    url = positional[0]
+    filename = output_file or Path(urllib.parse.urlparse(url).path).name or "index.html"
+    dest = _resolve(filename, cwd)
+
+    yield _info(f"↓ {url}")
+    yield _out(f"  → {dest}")
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Andrux/2.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 8192
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded / total * 100
+                        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+                        yield _out(f"\r  [{bar}] {pct:5.1f}% {_fmt_size(downloaded)}/{_fmt_size(total)}")
+                    else:
+                        yield _out(f"\r  {_fmt_size(downloaded)} baixados...")
+        yield _info(f"\n✓ Salvo: {dest} ({_fmt_size(dest.stat().st_size)})")
+        return 0
+    except urllib.error.HTTPError as exc:
+        yield _err(f"wget: HTTP {exc.code}: {exc.reason}")
+        return 1
+    except urllib.error.URLError as exc:
+        yield _err(f"wget: {exc.reason}")
+        return 1
+    except OSError as exc:
+        yield _err(f"wget: {exc.strerror}")
+        return 1
+
+
+def native_curl(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """curl -L nativo via urllib com suporte a headers e output."""
+    url = None
+    output_file = None
+    headers_extra = {}
+    show_headers = False
+    silent = "-s" in args or "--silent" in args
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-o", "--output") and i + 1 < len(args):
+            output_file = args[i + 1]; i += 2
+        elif a in ("-H", "--header") and i + 1 < len(args):
+            k, _, v = args[i + 1].partition(":")
+            headers_extra[k.strip()] = v.strip(); i += 2
+        elif a in ("-I", "--head"):
+            show_headers = True; i += 1
+        elif not a.startswith("-"):
+            url = a; i += 1
+        else:
+            i += 1
+
+    if not url:
+        yield _err("curl: URL não especificada")
+        return 1
+
+    try:
+        hdrs = {"User-Agent": "Andrux/2.0 (curl-native)", **headers_extra}
+        req = urllib.request.Request(url, headers=hdrs)
+
+        if show_headers:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                yield _out(f"HTTP/1.1 {resp.status} {resp.reason}")
+                for k, v in resp.headers.items():
+                    yield _out(f"{k}: {v}")
+            return 0
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+
+        if output_file:
+            dest = _resolve(output_file, cwd)
+            dest.write_bytes(data)
+            if not silent:
+                yield _info(f"✓ Salvo: {dest} ({_fmt_size(len(data))})")
+        else:
+            try:
+                text = data.decode("utf-8", errors="replace")
+                for line in text.splitlines():
+                    yield _out(line)
+            except Exception:
+                yield _out(f"<dados binários: {_fmt_size(len(data))}>")
+        return 0
+
+    except urllib.error.HTTPError as exc:
+        yield _err(f"curl: HTTP {exc.code}: {exc.reason}")
+        return 1
+    except urllib.error.URLError as exc:
+        yield _err(f"curl: {exc.reason}")
+        return 1
+
+
+def native_myip(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """Retorna IP externo via API pública."""
+    services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for svc in services:
+        try:
+            req = urllib.request.Request(svc, headers={"User-Agent": "Andrux/2.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ip = resp.read().decode().strip()
+            yield _out(ip)
+            return 0
+        except Exception:
+            continue
+    yield _err("myip: não foi possível obter o IP externo")
+    return 1
+
+
+def native_dns(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """nslookup nativo via socket.getaddrinfo."""
+    if not args:
+        yield _err("dns: host não especificado")
+        return 1
+    host = args[0]
+    try:
+        results = socket.getaddrinfo(host, None)
+        seen = set()
+        yield _out(f"Server:\t\t(sistema)")
+        yield _out(f"Name:\t\t{host}")
+        for family, _, _, _, addr in results:
+            ip = addr[0]
+            if ip in seen:
+                continue
+            seen.add(ip)
+            fam_name = "IPv6" if family == socket.AF_INET6 else "IPv4"
+            yield _out(f"Address:\t{ip} ({fam_name})")
+        return 0
+    except socket.gaierror as exc:
+        yield _err(f"dns: '{host}': {exc.strerror or str(exc)}")
+        return 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  SISTEMA — ps, free, uname, env, uptime
+# ─────────────────────────────────────────────────────────────────
+
+def native_ps(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """ps nativo via /proc (Android/Linux) ou fallback."""
+    yield _out(f"{'PID':>7}  {'STAT':<5}  {'CMD'}")
+    yield _out("-" * 50)
+
+    # Tenta /proc (Android e Linux)
+    proc_dir = Path("/proc")
+    if proc_dir.exists():
+        count = 0
+        for p in sorted(proc_dir.iterdir()):
+            if not p.name.isdigit():
+                continue
+            pid = p.name
+            try:
+                status_file = p / "status"
+                cmdline_file = p / "cmdline"
+                state = "?"
+                name = "?"
+                if status_file.exists():
+                    for line in status_file.read_text().splitlines():
+                        if line.startswith("Name:"):
+                            name = line.split(":", 1)[1].strip()
+                        if line.startswith("State:"):
+                            state = line.split(":", 1)[1].strip()[:1]
+                if cmdline_file.exists():
+                    cmd = cmdline_file.read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip()
+                    if cmd:
+                        name = cmd[:60]
+                yield _out(f"{pid:>7}  {state:<5}  {name}")
+                count += 1
+            except (PermissionError, OSError):
+                pass
+        yield _info(f"\n{count} processos listados")
+    else:
+        yield _warn("ps: /proc não disponível nesta plataforma")
+        # Fallback: apenas o processo atual
+        yield _out(f"{os.getpid():>7}  R      python3 (processo atual)")
+    return 0
+
+
+def native_free(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """free -h nativo via /proc/meminfo."""
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        data = {}
+        for line in meminfo.read_text().splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                nums = re.findall(r"\d+", v)
+                if nums:
+                    data[k.strip()] = int(nums[0]) * 1024  # kB → bytes
+
+        total = data.get("MemTotal", 0)
+        free_ = data.get("MemFree", 0)
+        avail = data.get("MemAvailable", free_)
+        bufs  = data.get("Buffers", 0)
+        cache = data.get("Cached", 0)
+        used  = total - avail
+        swap_total = data.get("SwapTotal", 0)
+        swap_free  = data.get("SwapFree", 0)
+        swap_used  = swap_total - swap_free
+
+        yield _out(f"{'':16} {'total':>9} {'used':>9} {'free':>9} {'available':>9}")
+        yield _out(
+            f"{'Mem:':16} {_fmt_size(total):>9} {_fmt_size(used):>9} "
+            f"{_fmt_size(free_):>9} {_fmt_size(avail):>9}"
+        )
+        if swap_total:
+            yield _out(
+                f"{'Swap:':16} {_fmt_size(swap_total):>9} {_fmt_size(swap_used):>9} "
+                f"{_fmt_size(swap_free):>9}"
+            )
+    else:
+        # macOS / Windows fallback
+        try:
+            import ctypes
+            if platform.system() == "Windows":
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                m = MEMORYSTATUSEX()
+                m.dwLength = ctypes.sizeof(m)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+                yield _out(f"Total: {_fmt_size(m.ullTotalPhys)}")
+                yield _out(f"Livre: {_fmt_size(m.ullAvailPhys)}")
+                yield _out(f"Uso:   {m.dwMemoryLoad}%")
+        except Exception:
+            yield _warn("free: informações de memória não disponíveis")
+    return 0
+
+
+def native_uname(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """uname -a nativo."""
+    show_all = "-a" in args
+    p = platform.uname()
+    if show_all:
+        yield _out(f"{p.system} {p.node} {p.release} {p.version} {p.machine} {p.processor or p.machine}")
+    else:
+        parts = []
+        if "-s" in args or not args:
+            parts.append(p.system)
+        if "-n" in args:
+            parts.append(p.node)
+        if "-r" in args:
+            parts.append(p.release)
+        if "-m" in args:
+            parts.append(p.machine)
+        yield _out(" ".join(parts) if parts else p.system)
+    return 0
+
+
+def native_env_list(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """env: lista variáveis de ambiente."""
+    for k, v in sorted(env.items()):
+        yield _out(f"{k}={v}")
+    return 0
+
+
+def native_uptime(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """uptime nativo."""
+    uptime_file = Path("/proc/uptime")
+    if uptime_file.exists():
+        secs = float(uptime_file.read_text().split()[0])
+        d, rem = divmod(int(secs), 86400)
+        h, rem = divmod(rem, 3600)
+        m, s   = divmod(rem, 60)
+        yield _out(f"up {d}d {h:02}:{m:02}:{s:02}")
+    else:
+        yield _out(f"uptime: plataforma não suporta /proc/uptime")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────
+#  PYTHON / PIP — nativo via importlib + pip module
+# ─────────────────────────────────────────────────────────────────
+
+def native_pip(subcmd: str, args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """
+    pip nativo: usa o próprio módulo pip do Python.
+    No Android (APK), o pip está embutido no Python empacotado.
+    """
+    import io
+
+    # Tenta importar pip como módulo
+    try:
+        import pip._internal.cli.main as pip_main
+        _has_pip_module = True
+    except ImportError:
+        _has_pip_module = False
+
+    full_args = [subcmd] + args
+
+    if _has_pip_module:
+        # Captura stdout/stderr do pip
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = buf_out = io.StringIO()
+        sys.stderr = buf_err = io.StringIO()
+        try:
+            rc = pip_main.main(full_args)
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 0
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+        for line in buf_out.getvalue().splitlines():
+            if line.strip():
+                yield _out(line)
+        for line in buf_err.getvalue().splitlines():
+            if line.strip():
+                yield _err(line)
+        return rc if isinstance(rc, int) else 0
+
+    else:
+        # Fallback: subprocess python -m pip (funciona se Python estiver no PATH)
+        yield _warn("pip: módulo nativo não encontrado, tentando python -m pip...")
+        if _HAS_SUBPROCESS:
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "pip"] + full_args,
+                    capture_output=True, text=True, cwd=cwd
+                )
+                for line in proc.stdout.splitlines():
+                    yield _out(line)
+                for line in proc.stderr.splitlines():
+                    yield _err(line)
+                return proc.returncode
+            except Exception as exc:
+                yield _err(f"pip: {exc}")
+                return 1
+        else:
+            yield _err("pip: não disponível neste ambiente")
+            return 1
+
+
+def native_pip_list(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """pip list nativo via importlib.metadata."""
+    pkgs = []
+    if importlib_metadata:
+        try:
+            pkgs = sorted(importlib_metadata.packages_distributions().keys())
+        except Exception:
+            pass
+        if not pkgs:
+            try:
+                pkgs = sorted(d.metadata["Name"] for d in importlib_metadata.distributions())
+            except Exception:
+                pass
+
+    if pkgs:
+        yield _out(f"{'Package':<30} {'Version'}")
+        yield _out("-" * 45)
+        for pkg in pkgs:
+            try:
+                ver = importlib_metadata.version(pkg)
+            except Exception:
+                ver = "?"
+            yield _out(f"{pkg:<30} {ver}")
+        yield _info(f"\n{len(pkgs)} pacotes instalados")
+    else:
+        yield _warn("pip list: não foi possível listar pacotes")
+    return 0
+
+
+def native_pip_show(pkg: str, args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """pip show nativo via importlib.metadata."""
+    if not importlib_metadata:
+        yield _err("pip show: importlib.metadata não disponível")
+        return 1
+    try:
+        meta = importlib_metadata.metadata(pkg)
+        for key in ("Name", "Version", "Summary", "Author", "License", "Home-page", "Location"):
+            val = meta.get(key)
+            if val:
+                yield _out(f"{key}: {val}")
+        return 0
+    except importlib_metadata.PackageNotFoundError:
+        yield _err(f"pip show: '{pkg}' não encontrado")
+        return 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  GIT — clone, status, add, commit, push, pull, log, branch, diff
+# ─────────────────────────────────────────────────────────────────
+
+def _find_git_root(cwd: str) -> Optional[Path]:
+    """Sobe no diretório até encontrar .git"""
+    p = Path(cwd)
+    while p != p.parent:
+        if (p / ".git").exists():
+            return p
+        p = p.parent
+    return None
+
+
+def _git_via_subprocess(git_args: list[str], cwd: str) -> CmdGenerator:
+    """Tenta executar git real via subprocess como fallback."""
+    git_bin = shutil.which("git")
+    if not git_bin:
+        yield _err("git: binário não encontrado no PATH")
+        yield _warn("  Instale git ou use os comandos nativos do Andrux.")
+        return 127
+
+    if not _HAS_SUBPROCESS:
+        yield _err("git: subprocess não disponível neste ambiente")
+        return 1
+
+    try:
+        proc = subprocess.Popen(
+            [git_bin] + git_args,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=cwd, text=True
+        )
+        for line in proc.stdout:
+            yield _out(line.rstrip())
+        for line in proc.stderr:
+            yield _err(line.rstrip())
+        return proc.wait()
+    except Exception as exc:
+        yield _err(f"git: {exc}")
+        return 1
+
+
+def native_git_status(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git status nativo: lê .git/index e HEAD."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git (ou nenhum diretório pai)")
+        return 128
+
+    git_dir = root / ".git"
+
+    # HEAD
+    head_file = git_dir / "HEAD"
+    branch = "unknown"
+    if head_file.exists():
+        head = head_file.read_text().strip()
+        if head.startswith("ref: refs/heads/"):
+            branch = head[len("ref: refs/heads/"):]
+        else:
+            branch = head[:8] + "... (HEAD detached)"
+
+    yield _out(f"On branch {branch}")
+
+    # Arquivos não rastreados
+    try:
+        gitignore_patterns = []
+        gi = root / ".gitignore"
+        if gi.exists():
+            gitignore_patterns = [
+                line.strip() for line in gi.read_text().splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+
+        untracked = []
+        for p in sorted(root.rglob("*")):
+            if ".git" in p.parts:
+                continue
+            if p.is_file():
+                rel = str(p.relative_to(root))
+                ignored = any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(p.name, pat)
+                              for pat in gitignore_patterns)
+                if not ignored:
+                    untracked.append(rel)
+
+        if untracked:
+            yield _out("\nUntracked files:")
+            yield _out("  (use \"git add <file>...\")")
+            for f in untracked[:20]:
+                yield _out(f"\t{f}")
+            if len(untracked) > 20:
+                yield _out(f"\t... e mais {len(untracked) - 20} arquivo(s)")
+        else:
+            yield _out("\nnothing to commit, working tree clean")
+    except Exception:
+        pass
+
+    return 0
+
+
+def native_git_log(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git log nativo: lê objetos do .git."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+
+    git_dir = root / ".git"
+    head_file = git_dir / "HEAD"
+    if not head_file.exists():
+        yield _warn("Repositório vazio (sem commits)")
+        return 0
+
+    head = head_file.read_text().strip()
+    if head.startswith("ref:"):
+        ref_path = git_dir / head[5:]
+        if not ref_path.exists():
+            yield _warn("Repositório vazio (sem commits)")
+            return 0
+        commit_hash = ref_path.read_text().strip()
+    else:
+        commit_hash = head
+
+    count = 0
+    limit = 20
+    for a in args:
+        if a.startswith("-") and a[1:].isdigit():
+            limit = int(a[1:])
+
+    while commit_hash and count < limit:
+        obj_path = git_dir / "objects" / commit_hash[:2] / commit_hash[2:]
+        if not obj_path.exists():
+            break
+        try:
+            import zlib
+            raw = zlib.decompress(obj_path.read_bytes())
+            header, _, body = raw.partition(b"\x00")
+            fields = {}
+            msg_lines = []
+            in_msg = False
+            for line in body.decode(errors="replace").splitlines():
+                if in_msg:
+                    msg_lines.append(line)
+                elif line == "":
+                    in_msg = True
+                else:
+                    k, _, v = line.partition(" ")
+                    fields[k] = v
+            author = fields.get("author", "unknown")
+            date_ts = int(author.split()[-2]) if author.split() else 0
+            author_name = " ".join(author.split()[:-2]) if author else "?"
+            date_str = datetime.fromtimestamp(date_ts).strftime("%Y-%m-%d %H:%M") if date_ts else "?"
+            msg = " ".join(msg_lines).strip()[:72]
+            yield _out(f"\033[33m{commit_hash[:8]}\033[0m {msg}")
+            yield _out(f"  Author: {author_name}")
+            yield _out(f"  Date:   {date_str}")
+            yield _out("")
+            commit_hash = fields.get("parent", "")
+            count += 1
+        except Exception:
+            # Git pack files ou zlib falhou — usa git real
+            yield from _git_via_subprocess(["log", "--oneline", f"-{limit}"], cwd)
+            return 0
+
+    if count == 0:
+        yield _warn("git log: sem commits ou formato de objeto não suportado")
+        yield from _git_via_subprocess(["log", "--oneline", f"-{limit}"], cwd)
+    return 0
+
+
+def native_git_branch(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git branch nativo."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+
+    git_dir = root / ".git"
+    heads_dir = git_dir / "refs" / "heads"
+
+    # Branch atual
+    current = ""
+    head_file = git_dir / "HEAD"
+    if head_file.exists():
+        head = head_file.read_text().strip()
+        if head.startswith("ref: refs/heads/"):
+            current = head[len("ref: refs/heads/"):]
+
+    if heads_dir.exists():
+        branches = sorted(p.name for p in heads_dir.iterdir() if p.is_file())
+        for b in branches:
+            prefix = "* " if b == current else "  "
+            yield _out(f"{prefix}{b}")
+    else:
+        yield _out(f"* {current or 'main'} (branch inicial)")
+
+    # Branches remotas
+    remotes_dir = git_dir / "refs" / "remotes"
+    if remotes_dir.exists() and ("-a" in args or "--all" in args):
+        for remote in sorted(remotes_dir.iterdir()):
+            for branch_file in sorted(remote.iterdir()):
+                yield _out(f"  remotes/{remote.name}/{branch_file.name}")
+    return 0
+
+
+def native_git_diff(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git diff nativo: compara arquivos com index."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+    # diff real requer parsing do index — delega para git real se disponível
+    yield from _git_via_subprocess(["diff"] + args, cwd)
+    return 0
+
+
+def native_git_add(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git add via git real ou confirmação visual."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+    result = list(_git_via_subprocess(["add"] + (args or ["."]), cwd))
+    if result:
+        yield from result
+    else:
+        target = " ".join(args) if args else "."
+        yield _info(f"✓ git add {target}")
+    return 0
+
+
+def native_git_commit(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git commit via git real."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+    yield from _git_via_subprocess(["commit"] + args, cwd)
+    return 0
+
+
+def native_git_push(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git push via git real."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+    yield from _git_via_subprocess(["push"] + args, cwd)
+    return 0
+
+
+def native_git_pull(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git pull via git real."""
+    root = _find_git_root(cwd)
+    if not root:
+        yield _err("fatal: não é um repositório git")
+        return 128
+    yield from _git_via_subprocess(["pull"] + args, cwd)
+    return 0
+
+
+def native_git_clone(args: list[str], cwd: str, env: dict) -> CmdGenerator:
+    """git clone via urllib (download do zip do GitHub/GitLab) ou git real."""
+    # Primeiro tenta git real
+    git_bin = shutil.which("git")
+    if git_bin and _HAS_SUBPROCESS:
+        yield from _git_via_subprocess(["clone"] + args, cwd)
+        return 0
+
+    # Fallback nativo: GitHub/GitLab suportam download de zip
+    if not args:
+        yield _err("git clone: URL não especificada")
+        return 1
+
+    url = args[0]
+    dest_name = Path(urllib.parse.urlparse(url).path).stem
+    if dest_name.endswith(".git"):
+        dest_name = dest_name[:-4]
+    dest = Path(cwd) / (args[1] if len(args) > 1 else dest_name)
+
+    # Tenta converter URL git para URL de arquivo zip
+    zip_url = None
+    gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+    gl_match = re.match(r"https?://gitlab\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+
+    if gh_match:
+        user, repo = gh_match.groups()
+        zip_url = f"https://github.com/{user}/{repo}/archive/refs/heads/main.zip"
+    elif gl_match:
+        user, repo = gl_match.groups()
+        zip_url = f"https://gitlab.com/{user}/{repo}/-/archive/main/{repo}-main.zip"
+
+    if not zip_url:
+        yield _err(f"git clone: URL não suportada sem git instalado: {url}")
+        yield _warn("  Suportado: github.com e gitlab.com")
+        return 1
+
+    yield _info(f"Clonando {url} via download ZIP...")
+    try:
+        req = urllib.request.Request(zip_url, headers={"User-Agent": "Andrux/2.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            zip_data = resp.read()
+
+        with zipfile.ZipFile(BytesIO(zip_data)) as zf:
+            members = zf.namelist()
+            prefix = members[0] if members else ""
+            dest.mkdir(parents=True, exist_ok=True)
+            for member in members:
+                target = dest / member[len(prefix):]
+                if member.endswith("/"):
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(zf.read(member))
+
+        yield _info(f"✓ Clonado em: {dest}")
+        yield _warn("  Nota: clone via ZIP não inclui histórico git completo")
+        return 0
+    except Exception as exc:
+        yield _err(f"git clone: {exc}")
+        return 1
+
+
+# ─────────────────────────────────────────────────────────────────
+#  DISPATCHER PRINCIPAL
+# ─────────────────────────────────────────────────────────────────
+
+class NativeEngine:
+    """
+    Dispatcher central do motor nativo.
+    
+    Recebe um comando traduzido (ex: "ls -la /tmp") e decide:
+    1. Se existe implementação nativa Python → executa ela
+    2. Se o binário existe no PATH → usa subprocess (fallback)
+    3. Se não há nada → retorna erro claro com sugestão
+    """
+
+    # Mapeamento: primeiro token do comando → handler nativo
+    NATIVE_MAP: dict[str, Callable] = {
+        "ls":       native_ls,
+        "cat":      native_cat,
+        "mkdir":    native_mkdir,
+        "rm":       native_rm,
+        "cp":       native_cp,
+        "mv":       native_mv,
+        "find":     native_find,
+        "du":       native_du,
+        "df":       native_df,
+        "which":    native_which,
+        "touch":    native_touch,
+        "wc":       native_wc,
+        "grep":     native_grep,
+        "ping":     native_ping,
+        "wget":     native_wget,
+        "curl":     native_curl,
+        "ps":       native_ps,
+        "free":     native_free,
+        "uname":    native_uname,
+        "env":      native_env_list,
+        "uptime":   native_uptime,
+        "nslookup": native_dns,
+    }
+
+    # Comandos que têm lógica especial de dispatch
+    SPECIAL = {"pip", "git", "python3", "python"}
+
+    def __init__(self, shell_cwd_getter: Callable[[], str],
+                 shell_env_getter: Callable[[], dict]):
+        self._get_cwd = shell_cwd_getter
+        self._get_env = shell_env_getter
+
+    def can_handle(self, translated_command: str) -> bool:
+        """Retorna True se o NativeEngine tem handler para este comando."""
+        parts = translated_command.strip().split()
+        if not parts:
+            return False
+        cmd = parts[0].lower()
+        return cmd in self.NATIVE_MAP or cmd in self.SPECIAL
+
+    def execute(
+        self,
+        translated_command: str,
+        stdout_cb: Callable[[str], None],
+        stderr_cb: Callable[[str], None],
+        done_cb: Callable[[int], None],
+    ):
+        """Executa via motor nativo em thread separada."""
+        def run():
+            cwd = self._get_cwd()
+            env = self._get_env()
+            parts = translated_command.strip().split(None)
+            if not parts:
+                done_cb(0)
+                return
+            cmd = parts[0].lower()
+            args = parts[1:]
+            rc = 0
+            try:
+                gen = self._dispatch(cmd, args, cwd, env)
+                for text, category in gen:
+                    if category in ("out", "info"):
+                        stdout_cb(text)
+                    else:
+                        stderr_cb(text)
+            except StopIteration as e:
+                rc = e.value if isinstance(e.value, int) else 0
+            except Exception as exc:
+                stderr_cb(f"native engine error: {exc}")
+                rc = 1
+            done_cb(rc)
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+    def _dispatch(self, cmd: str, args: list[str], cwd: str, env: dict) -> CmdGenerator:
+        """Despacha para o handler correto, consumindo o generator inteiro."""
+
+        # ── pip ────────────────────────────────────────────────────────
+        if cmd == "pip":
+            if not args:
+                yield _err("pip: subcomando não especificado")
+                return 1
+            subcmd = args[0]
+            sub_args = args[1:]
+            if subcmd == "list":
+                yield from native_pip_list(sub_args, cwd, env)
+            elif subcmd == "show" and sub_args:
+                yield from native_pip_show(sub_args[0], sub_args[1:], cwd, env)
+            else:
+                yield from native_pip(subcmd, sub_args, cwd, env)
+            return
+
+        # ── git ────────────────────────────────────────────────────────
+        if cmd == "git":
+            if not args:
+                yield _err("git: subcomando não especificado")
+                return 1
+            sub = args[0]
+            sub_args = args[1:]
+            git_dispatch = {
+                "status":  native_git_status,
+                "log":     native_git_log,
+                "branch":  native_git_branch,
+                "diff":    native_git_diff,
+                "add":     native_git_add,
+                "commit":  native_git_commit,
+                "push":    native_git_push,
+                "pull":    native_git_pull,
+                "clone":   native_git_clone,
+            }
+            handler = git_dispatch.get(sub)
+            if handler:
+                yield from handler(sub_args, cwd, env)
+            else:
+                yield from _git_via_subprocess([sub] + sub_args, cwd)
+            return
+
+        # ── python3 / python ──────────────────────────────────────────
+        if cmd in ("python3", "python"):
+            if not args:
+                yield _err("python3: nenhum script ou código especificado")
+                return 1
+            if args[0] == "-c" and len(args) > 1:
+                # Executa código inline capturando output
+                code = " ".join(args[1:])
+                import io, contextlib
+                buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                        exec(compile(code, "<andrux-inline>", "exec"), {})
+                    for line in buf.getvalue().splitlines():
+                        yield _out(line)
+                except Exception as exc:
+                    yield _err(f"python3: {type(exc).__name__}: {exc}")
+                    return 1
+            else:
+                # Executa arquivo .py
+                script = _resolve(args[0], cwd)
+                if not script.exists():
+                    yield _err(f"python3: '{args[0]}': arquivo não encontrado")
+                    return 1
+                import io, contextlib
+                buf = io.StringIO()
+                old_argv = sys.argv[:]
+                sys.argv = [str(script)] + args[1:]
+                try:
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                        code_text = script.read_text(encoding="utf-8")
+                        exec(compile(code_text, str(script), "exec"),
+                             {"__file__": str(script), "__name__": "__main__"})
+                    for line in buf.getvalue().splitlines():
+                        yield _out(line)
+                except SystemExit as e:
+                    if e.code:
+                        yield _err(f"[exit {e.code}]")
+                except Exception as exc:
+                    yield _err(f"python3: {type(exc).__name__}: {exc}")
+                    return 1
+                finally:
+                    sys.argv = old_argv
+            return
+
+        # ── handlers diretos ──────────────────────────────────────────
+        handler = self.NATIVE_MAP.get(cmd)
+        if handler:
+            yield from handler(args, cwd, env)
+            return
+
+        # ── fallback: binário não encontrado ──────────────────────────
+        yield _err(f"andrux: '{cmd}': comando não encontrado")
+        yield _warn(f"  Este comando requer binário externo não disponível no APK.")
+        yield _warn(f"  Sugestões:")
+        yield _warn(f"    • Verifique se o Andrux tem uma versão nativa (help)")
+        yield _warn(f"    • Em Termux: get install {cmd}")
+        return 1
 
 
 # ─────────────────────────────────────────────
@@ -488,6 +2046,15 @@ class AndruxShell:
         self._process: Optional[subprocess.Popen] = None
         self._running = False
 
+        # Motor nativo: executa comandos sem binários externos
+        if self.native is not None:
+            self.native = NativeEngine(
+                shell_cwd_getter=lambda: self.cwd,
+                shell_env_getter=lambda: self.env,
+            )
+        else:
+            self.native = None
+
     def get_prompt_path(self) -> str:
         home = str(Path.home())
         if self.cwd.startswith(home):
@@ -512,14 +2079,22 @@ class AndruxShell:
         stderr_cb: Callable[[str], None],
         done_cb: Callable[[int], None],
     ):
-        """Executa comando em thread separada com streaming de output."""
+        """
+        Executa comando com prioridade:
+        1. Comandos built-in (cd, export)
+        2. Motor nativo Python (NativeEngine) — sem binários externos
+        3. Subprocess + shell do sistema — fallback
+        """
 
         def run():
             self._running = True
-            # Trata cd separadamente
-            cd_match = re.match(r"^\s*cd\s+(.*)", command)
+
+            # ── Built-in: cd ─────────────────────────────────────────
+            cd_match = re.match(r"^\s*cd\s*(.*)", command)
             if cd_match:
-                target = cd_match.group(1).strip() or str(Path.home())
+                target = cd_match.group(1).strip() or (
+                    tempfile.gettempdir() if IS_ANDROID else str(Path.home())
+                )
                 ok, msg = self.set_cwd(target)
                 if ok:
                     done_cb(0)
@@ -529,7 +2104,7 @@ class AndruxShell:
                 self._running = False
                 return
 
-            # Trata export separadamente
+            # ── Built-in: export ──────────────────────────────────────
             export_match = re.match(r"^\s*export\s+(\w+)=(.*)", command)
             if export_match:
                 self.env[export_match.group(1)] = export_match.group(2)
@@ -538,17 +2113,23 @@ class AndruxShell:
                 self._running = False
                 return
 
-            # ── BUG FIX #2: Shell correto por plataforma ──────────────
-            # Android não tem 'bash' nativamente fora do Termux.
-            # O shell universal do Android é /system/bin/sh.
-            # Fazemos detecção em ordem de preferência.
+            # ── Motor nativo Python ───────────────────────────────────
+            if self.native and self.native.can_handle(command):
+                # NativeEngine gerencia sua própria thread e chama done_cb
+                self.native.execute(
+                    command,
+                    stdout_cb,
+                    stderr_cb,
+                    lambda rc: (setattr(self, "_running", False), done_cb(rc)),
+                )
+                return  # não seta _running = False aqui; NativeEngine faz isso
+
+            # ── Subprocess fallback ───────────────────────────────────
+            # BUG FIX #2: Shell correto por plataforma
             if IS_WINDOWS:
                 shell_exec = ["cmd", "/c", command]
             elif IS_ANDROID:
-                # Tenta sh do Android, com fallback para qualquer sh disponível
                 for sh in ["/system/bin/sh", "/bin/sh", "sh"]:
-                    if IS_WINDOWS:
-                        break
                     try:
                         if sh.startswith("/"):
                             if os.path.isfile(sh):
@@ -563,7 +2144,6 @@ class AndruxShell:
                 else:
                     shell_exec = ["sh", "-c", command]
             else:
-                # Linux/macOS: prefere bash, cai para sh
                 shell_exec = [shutil.which("bash") or "sh", "-c", command]
 
             try:
@@ -578,14 +2158,12 @@ class AndruxShell:
                     universal_newlines=True,
                 )
 
-                # Stream stdout
                 def read_stdout():
                     for line in iter(self._process.stdout.readline, ""):
                         if line:
                             stdout_cb(line.rstrip("\n"))
                     self._process.stdout.close()
 
-                # Stream stderr
                 def read_stderr():
                     for line in iter(self._process.stderr.readline, ""):
                         if line:
@@ -594,16 +2172,16 @@ class AndruxShell:
 
                 t1 = threading.Thread(target=read_stdout, daemon=True)
                 t2 = threading.Thread(target=read_stderr, daemon=True)
-                t1.start()
-                t2.start()
-                t1.join()
-                t2.join()
-
+                t1.start(); t2.start()
+                t1.join(); t2.join()
                 rc = self._process.wait()
                 done_cb(rc)
 
             except FileNotFoundError:
-                stderr_cb(f"andrux: comando não encontrado: {command.split()[0]}")
+                # Binário não existe — sugere alternativa nativa
+                first = command.split()[0]
+                stderr_cb(f"andrux: '{first}': não encontrado no PATH do APK")
+                stderr_cb(f"  Use o comando Andrux equivalente ou: get install {first}")
                 done_cb(127)
             except Exception as e:
                 stderr_cb(f"andrux: erro de execução: {e}")
