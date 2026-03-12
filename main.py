@@ -49,45 +49,105 @@ ANDRUX_CODENAME = "PHANTOM"
 
 IS_ANDROID = hasattr(sys, "getandroidapilevel") or os.path.exists("/system/app")
 IS_WINDOWS = platform.system() == "Windows"
-IS_LINUX = platform.system() == "Linux"
+IS_LINUX   = platform.system() == "Linux"
 
-# ── BUG FIX #1: Path seguro para Android ──────────────────────────
-# Path.home() no Android aponta para um local sem permissão de escrita,
-# causando OSError e fechamento imediato do app.
-# Solução: detectar a plataforma e usar o diretório gravável correto.
+# ── Detecção Android robusta ──────────────────────────────────────
+# No APK Flet, sys.getandroidapilevel pode não existir ainda no import.
+# Usamos múltiplas heurísticas para garantir detecção correta.
+def _detect_android() -> bool:
+    if hasattr(sys, "getandroidapilevel"):
+        return True
+    if os.path.exists("/system/build.prop"):
+        return True
+    if os.path.exists("/system/app"):
+        return True
+    # Flet empacota o app em /data/user/0/<pkg>/files/flet/
+    if "/data/user/" in str(getattr(sys, "argv", [""])[0]):
+        return True
+    if "/data/data/" in str(getattr(sys, "argv", [""])[0]):
+        return True
+    # Path.home() no contexto Flet/Android retorna algo dentro de /data
+    try:
+        h = str(Path.home())
+        if h.startswith("/data") or h == "/":
+            return True
+    except Exception:
+        return True
+    return False
+
+IS_ANDROID = _detect_android()
+
+# ── Diretório base: LAZY — calculado só quando chamado, nunca no import ──
+# O crash acontecia porque _get_safe_base_dir() era chamado no nível do
+# módulo, antes do Flet/Android inicializar o contexto de arquivos.
+# Agora é uma função pura chamada apenas dentro de main().
+_ANDRUX_DIR_CACHE: Optional[Path] = None
+
 def _get_safe_base_dir() -> Path:
-    """Retorna diretório base com garantia de escrita em qualquer plataforma."""
-    candidates = []
+    """
+    Retorna diretório base gravável. Resultado é cacheado após primeira chamada.
+    NUNCA chame isto em nível de módulo — só dentro de funções.
+    """
+    global _ANDRUX_DIR_CACHE
+    if _ANDRUX_DIR_CACHE is not None:
+        return _ANDRUX_DIR_CACHE
+
+    # Flet Android expõe o diretório de dados via variável de ambiente
+    flet_app_dir = os.environ.get("FLET_APP_STORAGE_DATA") or \
+                   os.environ.get("FLET_APP_STORAGE_TEMP")
+
+    candidates: list[Path] = []
+
+    if flet_app_dir:
+        # Melhor opção: diretório oficial do Flet no Android
+        candidates.append(Path(flet_app_dir) / "andrux")
+
     if IS_ANDROID:
-        # Android: tempfile.gettempdir() retorna /data/local/tmp — sempre gravável.
-        candidates = [
+        # Fallbacks Android em ordem de preferência
+        candidates += [
             Path(tempfile.gettempdir()) / "andrux",
             Path("/data/local/tmp/andrux"),
         ]
+        # Tenta extrair o data dir do path do script atual
+        script = str(getattr(sys, "argv", [""])[0])
+        if "/files/flet/" in script:
+            pkg_data = script.split("/files/flet/")[0] + "/files"
+            candidates.insert(0, Path(pkg_data) / "andrux")
     else:
-        candidates = [
+        candidates += [
             Path.home() / ".andrux",
             Path(tempfile.gettempdir()) / "andrux",
         ]
+
     for candidate in candidates:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
-            test_file = candidate / ".write_test"
-            test_file.write_text("ok")
-            test_file.unlink()
+            test = candidate / ".write_test"
+            test.write_text("ok")
+            test.unlink()
+            _ANDRUX_DIR_CACHE = candidate
             return candidate
         except OSError:
             continue
-    fallback = Path(tempfile.gettempdir()) / "andrux_fallback"
-    fallback.mkdir(parents=True, exist_ok=True)
+
+    # Último recurso absoluto
+    fallback = Path(tempfile.gettempdir()) / "andrux_safe"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    _ANDRUX_DIR_CACHE = fallback
     return fallback
 
-ANDRUX_DIR   = _get_safe_base_dir()
-HISTORY_FILE = ANDRUX_DIR / "history.json"
-ALIAS_FILE   = ANDRUX_DIR / "aliases.json"
-CONFIG_FILE  = ANDRUX_DIR / "config.json"
-LOG_FILE     = ANDRUX_DIR / "andrux.log"
-SCRIPTS_DIR  = ANDRUX_DIR / "scripts"
+
+# ── Paths: propriedades calculadas em runtime via função, nunca constantes ──
+def _get_history_file() -> Path: return _get_safe_base_dir() / "history.json"
+def _get_alias_file()   -> Path: return _get_safe_base_dir() / "aliases.json"
+def _get_config_file()  -> Path: return _get_safe_base_dir() / "config.json"
+def _get_log_file()     -> Path: return _get_safe_base_dir() / "andrux.log"
+def _get_scripts_dir()  -> Path: return _get_safe_base_dir() / "scripts"
+
+# Paths são calculados via _get_*() functions — nunca como constantes de módulo
 
 # Retro terminal color palette (ANSI-style mapped to Flet colors)
 COLORS = {
@@ -1688,8 +1748,8 @@ class NativeEngine:
 
 def ensure_andrux_dirs():
     """Garante que todos os diretórios do Andrux existam."""
-    ANDRUX_DIR.mkdir(parents=True, exist_ok=True)
-    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    _get_safe_base_dir().mkdir(parents=True, exist_ok=True)
+    _get_scripts_dir().mkdir(parents=True, exist_ok=True)
 
 
 def load_json(path: Path, default):
@@ -1729,14 +1789,14 @@ def datestamp() -> str:
 class AndruxConfig:
     def __init__(self):
         ensure_andrux_dirs()
-        self._data = {**DEFAULT_CONFIG, **load_json(CONFIG_FILE, {})}
+        self._data = {**DEFAULT_CONFIG, **load_json(_get_config_file(), {})}
 
     def get(self, key, default=None):
         return self._data.get(key, default)
 
     def set(self, key, value):
         self._data[key] = value
-        save_json(CONFIG_FILE, self._data)
+        save_json(_get_config_file(), self._data)
 
     def all(self):
         return dict(self._data)
@@ -1750,7 +1810,7 @@ class AndruxHistory:
     def __init__(self, config: AndruxConfig):
         self.config = config
         self.max_size = config.get("max_history", 500)
-        self._history: list[dict] = load_json(HISTORY_FILE, [])
+        self._history: list[dict] = load_json(_get_history_file(), [])
         self._pointer = len(self._history)
 
     def add(self, command: str):
@@ -1765,7 +1825,7 @@ class AndruxHistory:
         if len(self._history) > self.max_size:
             self._history = self._history[-self.max_size:]
         self._pointer = len(self._history)
-        save_json(HISTORY_FILE, self._history)
+        save_json(_get_history_file(), self._history)
 
     def prev(self) -> Optional[str]:
         if not self._history:
@@ -1792,7 +1852,7 @@ class AndruxHistory:
     def clear(self):
         self._history = []
         self._pointer = 0
-        save_json(HISTORY_FILE, [])
+        save_json(_get_history_file(), [])
 
 
 # ─────────────────────────────────────────────
@@ -1801,11 +1861,11 @@ class AndruxHistory:
 
 class AndruxAliasDB:
     def __init__(self):
-        self._aliases: dict[str, str] = load_json(ALIAS_FILE, {})
+        self._aliases: dict[str, str] = load_json(_get_alias_file(), {})
 
     def set(self, name: str, command: str):
         self._aliases[name] = command
-        save_json(ALIAS_FILE, self._aliases)
+        save_json(_get_alias_file(), self._aliases)
 
     def get(self, name: str) -> Optional[str]:
         return self._aliases.get(name)
@@ -1813,7 +1873,7 @@ class AndruxAliasDB:
     def delete(self, name: str) -> bool:
         if name in self._aliases:
             del self._aliases[name]
-            save_json(ALIAS_FILE, self._aliases)
+            save_json(_get_alias_file(), self._aliases)
             return True
         return False
 
@@ -2588,7 +2648,7 @@ class AndruxInternals:
         self._out(f"  Python: {sys.version.split()[0]}", COLORS["white"], False)
         self._out(f"  Plataforma: {'Android' if IS_ANDROID else platform.system()}", COLORS["white"], False)
         self._out(f"  CWD: {self.shell.cwd}", COLORS["white"], False)
-        self._out(f"  Config: {CONFIG_FILE}", COLORS["white"], False)
+        self._out(f"  Config: {_get_config_file()}", COLORS["white"], False)
         self._out(f"  Histórico: {len(self.history.all())} entradas", COLORS["white"], False)
         self._out(f"  Aliases: {len(self.alias_db.all())}", COLORS["white"], False)
 
@@ -2653,9 +2713,9 @@ class AndruxInternals:
         self._out_cyan("  Use 'fis /storage/emulated/0' para navegar.")
 
     def _scripts(self, args):
-        scripts = list(SCRIPTS_DIR.glob("*.sh")) + list(SCRIPTS_DIR.glob("*.py"))
+        scripts = list(_get_scripts_dir().glob("*.sh")) + list(_get_scripts_dir().glob("*.py"))
         if not scripts:
-            self._out_yellow(f"Nenhum script em {SCRIPTS_DIR}")
+            self._out_yellow(f"Nenhum script em {_get_scripts_dir()}")
             self._out_cyan("  Crie scripts .sh ou .py nesse diretório.")
             return
         self._out_header(f"  SCRIPTS ({len(scripts)})")
@@ -2672,13 +2732,13 @@ class AndruxInternals:
             return
         name = args[0]
         candidates = [
-            SCRIPTS_DIR / name,
-            SCRIPTS_DIR / f"{name}.sh",
-            SCRIPTS_DIR / f"{name}.py",
+            _get_scripts_dir() / name,
+            _get_scripts_dir() / f"{name}.sh",
+            _get_scripts_dir() / f"{name}.py",
         ]
         found = next((p for p in candidates if p.exists()), None)
         if not found:
-            self._out_red(f"Script '{name}' não encontrado em {SCRIPTS_DIR}")
+            self._out_red(f"Script '{name}' não encontrado em {_get_scripts_dir()}")
             return
         self._out_cyan(f"▶ Executando: {found.name}")
         if found.suffix == ".py":
